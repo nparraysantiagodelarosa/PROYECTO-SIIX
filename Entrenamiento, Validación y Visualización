@@ -1,0 +1,245 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset, random_split, ConcatDataset
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.metrics import classification_report, roc_auc_score, f1_score, accuracy_score, precision_score, recall_score, confusion_matrix, roc_curve
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+
+file_path=Path(r"C:\Users\vgonzalez\Desktop\codigosconbasenueva\dtbasenueva.xlsx")
+df=pd.read_excel(file_path)
+df["CLASE"]=(df["TARGET"]>90).astype(int)
+
+X=df.drop(columns=["TARGET","CLASE"])
+y=df["CLASE"]
+
+
+X_encoded=pd.get_dummies(X, dtype=int)
+X_e=pd.get_dummies(X,dtype=int)
+
+
+scaler=StandardScaler()
+X_encoded=scaler.fit_transform(X_encoded)
+
+X_tensor=torch.tensor(X_encoded,dtype=torch.float32)
+y_tensor=torch.tensor(y.values,dtype=torch.float32).view(-1,1)
+
+dataset=TensorDataset(X_tensor,y_tensor)
+train_size=int(0.7*len(dataset))
+val_size=int(0.15*len(dataset))
+test_size=len(dataset)-train_size-val_size
+train_ds,val_ds, test_ds =random_split(dataset,[train_size,val_size,test_size])
+train_dl=DataLoader(train_ds,batch_size=64,shuffle=True)
+val_dl =DataLoader(val_ds,batch_size=8)
+test_dl=DataLoader(test_ds,batch_size=8)
+
+class FlexibleMLP(nn.Module):
+    def __init__(self, input_dim,hidden_layers,dropout_rate=0.2):
+        super().__init__()
+        layers=[]
+        prev_dim=input_dim
+        for hidden_dim in hidden_layers:
+            layers.append(nn.Linear(prev_dim,hidden_dim))
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            prev_dim=hidden_dim
+        layers.append(nn.Linear(prev_dim, 1))
+        layers.append(nn.Sigmoid())
+        self.net=nn.Sequential(*layers)
+    def forward(self,x):
+        return self.net(x)
+
+def train_validate_f1(model, train_dl, val_dl, class_weights=None, epochs=100, lr=0.01):
+    loss_fn=nn.BCELoss(weight=class_weights)
+    optimizer=torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,mode='max',factor=0.5,patience=20)
+    best_f1=0
+    best_state=None
+    history={'train_loss':[],'val_loss':[],'val_f1':[],'val_acc':[],'val_prec':[],'val_rec':[]}
+    for epoch in range(epochs):
+        model.train()
+        train_loss=0
+        for xb, yb in train_dl:
+            optimizer.zero_grad()
+            pred=model(xb)
+            loss=loss_fn(pred,yb)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        train_loss/=len(train_dl)
+        model.eval()
+        all_preds,all_labels,val_loss=[],[], 0
+        with torch.no_grad():
+            for xb, yb in val_dl:
+                pred=model(xb)
+                loss=loss_fn(pred, yb)
+                val_loss+=loss.item()
+                all_preds.extend(pred.numpy().flatten())
+                all_labels.extend(yb.numpy().flatten())
+        preds_bin = [1 if p >= 0.5 else 0 for p in all_preds]
+        f1=f1_score(all_labels,preds_bin)
+        acc=accuracy_score(all_labels,preds_bin)
+        prec= precision_score(all_labels,preds_bin)
+        rec=recall_score(all_labels,preds_bin)
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss/len(val_dl))
+        history['val_f1'].append(f1)
+        history['val_acc'].append(acc)
+        history['val_prec'].append(prec)
+        history['val_rec'].append(rec)
+        scheduler.step(f1)
+        if f1 > best_f1:
+            best_f1=f1
+            best_state=model.state_dict()
+    model.load_state_dict(best_state)
+    return model, best_f1, history
+architectures = [
+    [32],
+    [64],
+    [32,16],
+    [256,32],
+]
+results=[]
+results_acc=[]
+results_prec=[]
+results_rec=[]
+histories=[]
+input_dim=X_tensor.shape[1]
+
+clase_positiva=y_tensor.sum().item()
+clase_negativa=len(y_tensor)-clase_positiva
+peso_positivo=clase_negativa/len(y_tensor)
+peso_negativo=clase_positiva/len(y_tensor)
+class_weights_tensor=torch.tensor([peso_negativo],dtype=torch.float32)
+
+for arch in architectures:
+    model=FlexibleMLP(input_dim=input_dim,hidden_layers=arch)
+    model,f1,history = train_validate_f1(model,train_dl, val_dl,class_weights=class_weights_tensor)
+    results.append((arch,f1))
+    results_acc.append(accuracy_score(y_true=[1]*len(history['val_acc']), y_pred=[round(a) for a in history['val_acc']]))
+    results_prec.append(np.mean(history['val_prec']))
+    results_rec.append(np.mean(history['val_rec']))
+    histories.append((arch, history))
+    print(f"Arquitectura {arch} - Val F1: {f1:.4f}")
+
+best_arch=max(results, key=lambda x: x[1])[0]
+print("Mejor arquitectura (según F1):",best_arch)
+
+full_train_ds=ConcatDataset([train_ds,val_ds])
+full_train_dl=DataLoader(full_train_ds,batch_size=64,shuffle=True)
+best_model=FlexibleMLP(input_dim=input_dim,hidden_layers=best_arch)
+best_model,_,_= train_validate_f1(best_model,full_train_dl,test_dl,class_weights=class_weights_tensor)
+best_model.eval()
+
+all_preds,all_labels = [],[]
+with torch.no_grad():
+    for xb, yb in test_dl:
+        pred=best_model(xb)
+        all_preds.extend(pred.numpy().flatten())
+        all_labels.extend(yb.numpy().flatten())
+all_preds_bin = [1 if p >= 0.50 else 0 for p in all_preds]
+
+### IMPRIMIR ERRORES
+
+# all_preds=np.array(all_preds)
+# all_labels=np.array(all_labels)
+# all_preds_bin  np.array(all_preds_bin)
+
+
+# df_errores = pd.DataFrame({
+#     "Probabilidad": all_preds,
+#     "Predicción": all_preds_bin,
+#     "Etiqueta Real": all_labels
+# })
+
+# # Filtrar solo los errores (donde la predicción binaria no coincide con la etiqueta)
+# df_errores = df_errores[df_errores["Predicción"] != df_errores["Etiqueta Real"]]
+
+
+# print("\nErrores del modelo (predicción vs etiqueta real):")
+# print(df_errores.to_string(index=False))
+
+
+
+print(classification_report(all_labels, all_preds_bin))
+print("Test AUC:", roc_auc_score(all_labels, all_preds))
+print("Test F1:", f1_score(all_labels, all_preds_bin))
+print("Test Accuracy:", accuracy_score(all_labels, all_preds_bin))
+print("Test Precision:", precision_score(all_labels, all_preds_bin))
+print("Test Recall:", recall_score(all_labels, all_preds_bin))
+
+'''
+cm = confusion_matrix(all_labels, all_preds_bin)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.title('Matriz de confusión - Test')
+plt.show()
+'''
+
+'''
+# --- Graficar comparación de arquitecturas ---
+arch_labels = ['-'.join(map(str, arch)) for arch, _ in results]
+f1_scores = [f1 for _, f1 in results]
+
+plt.figure(figsize=(10, 6))
+bar_width = 0.2
+x = np.arange(len(arch_labels))
+
+plt.bar(x - 1.5 * bar_width, f1_scores, width=bar_width, label='F1', color='skyblue')
+plt.bar(x - 0.5 * bar_width, results_acc, width=bar_width, label='Accuracy', color='orange')
+plt.bar(x + 0.5 * bar_width, results_prec, width=bar_width, label='Precision', color='green')
+plt.bar(x + 1.5 * bar_width, results_rec, width=bar_width, label='Recall', color='red')
+
+plt.xticks(ticks=x, labels=arch_labels, rotation=45)
+plt.ylabel('Métrica')
+plt.title('Comparación de arquitecturas (F1, Accuracy, Precision, Recall)')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# --- Graficar desempeño por época ---
+for arch, history in histories:
+    epochs = list(range(1, len(history['val_f1']) + 1))
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, history['val_f1'], label='F1')
+    plt.plot(epochs, history['val_acc'], label='Accuracy')
+    plt.plot(epochs, history['val_prec'], label='Precision')
+    plt.plot(epochs, history['val_rec'], label='Recall')
+    plt.title(f'Desempeño por época - Arquitectura {arch}')
+    plt.xlabel('Épocas')
+    plt.ylabel('Métrica')
+    plt.ylim([0.7, 1.0])
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+'''
+
+
+# import joblib
+# columnas_originales = X.columns.tolist()
+# columnas_encoded = X_e.columns.tolist()
+
+# # guardar con rutas completas
+# torch.save(best_model.state_dict(), r"C:\Users\vgonzalez\Desktop\codigosconbasenueva\modelo_entrenadoBASENUEVA.pth")
+# joblib.dump(scaler, r"C:\Users\vgonzalez\Desktop\codigosconbasenueva\scalerBASENUEVA.pkl")
+
+# # guardar las columnas
+# with open(r"C:\Users\vgonzalez\Desktop\codigosconbasenueva\columnas_originalesBASENUEVA.txt", "w") as f:
+#     f.write('\n'.join(columnas_originales))
+
+# with open(r"C:\Users\vgonzalez\Desktop\codigosconbasenueva\columnas_encodedBASENUEVA.txt", 'w') as f:
+#     f.write('\n'.join(columnas_encoded))
+
+
+
+
+
+
+
+
