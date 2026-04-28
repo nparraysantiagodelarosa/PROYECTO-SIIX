@@ -4,7 +4,6 @@ from pathlib import Path
 import locale
 import datetime
 
-# Diccionario de traducción de meses
 meses_es_en = {
     'Ene': 'Jan', 'Feb': 'Feb', 'Mar': 'Mar', 'Abr': 'Apr',
     'May': 'May', 'Jun': 'Jun', 'Jul': 'Jul', 'Ago': 'Aug',
