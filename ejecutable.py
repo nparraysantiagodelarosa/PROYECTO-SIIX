@@ -210,7 +210,7 @@ def predecir():
         recomendacion = "El empleado tiene alta probabilidad de permanecer más de 90 días."
     else:
         resultado = "RENUNCIA < 90 DÍAS"
-        probabilidad = 1 - pred
+        probabilidad = 1-pred
         recomendacion = "El empleado tiene alto riesgo de renunciar antes de 90 días."
     
     probabilidad = pred
